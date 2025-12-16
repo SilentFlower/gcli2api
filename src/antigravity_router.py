@@ -469,12 +469,30 @@ async def convert_antigravity_stream_to_openai(
         "emitted_content": False,
         "emitted_reasoning": False,
         "sent_role": False,
-        "success_recorded": False
+        "success_recorded": False,
+        "final_sent": False,
+        "last_usage_metadata": None,
+        "last_finish_reason": None,
     }
 
     created = int(time.time())
 
     try:
+        def _extract_sse_data_payload(line: str) -> str:
+            """
+            从 SSE 单行中提取 data payload。
+
+            兼容上游两种常见格式：
+            - "data: {...}"
+            - "data:{...}"
+            """
+            if not line or not line.startswith("data:"):
+                return ""
+            payload = line[len("data:") :]
+            if payload.startswith(" "):
+                payload = payload[1:]
+            return payload
+
         def build_delta_chunk(delta: Dict[str, Any]) -> str:
             chunk = {
                 "id": request_id,
@@ -502,24 +520,86 @@ async def convert_antigravity_stream_to_openai(
                 delta = {**delta, "content": ""}
             return build_delta_chunk(delta)
 
+        def emit_final_chunk(
+            finish_reason_raw: Any,
+            usage_metadata: Optional[Dict[str, Any]] = None,
+        ) -> str:
+            """
+            发送最终 chunk（包含 finish_reason）。
+
+            重要：有些中转平台在做 OpenAI→Anthropic 时，会依赖 OpenAI 的
+            `finish_reason` 来触发 message_stop；如果只发 [DONE] 可能导致前端不渲染。
+            """
+            # 确定 finish_reason
+            openai_finish_reason = "stop"
+            if state["tool_calls"]:
+                openai_finish_reason = "tool_calls"
+            elif finish_reason_raw == "MAX_TOKENS":
+                openai_finish_reason = "length"
+
+            chunk: Dict[str, Any] = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": openai_finish_reason,
+                    }
+                ],
+            }
+
+            if usage_metadata:
+                chunk["usage"] = {
+                    "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
+                    "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
+                    "total_tokens": usage_metadata.get("totalTokenCount", 0),
+                }
+
+            return f"data: {json.dumps(chunk)}\n\n"
+
         async for line in response.aiter_lines():
-            if not line or not line.startswith("data: "):
+            if state["final_sent"]:
+                break
+
+            payload = _extract_sse_data_payload(line)
+            if not payload:
                 continue
 
-            # 记录第一次成功响应
-            if not state["success_recorded"]:
-                if credential_name and credential_manager:
-                    await credential_manager.record_api_call_result(credential_name, True, is_antigravity=True)
-                state["success_recorded"] = True
+            # 上游也可能发送 data: [DONE]
+            if payload.strip() == "[DONE]":
+                break
 
             # 解析 SSE 数据
             try:
-                data = json.loads(line[6:])  # 去掉 "data: " 前缀
+                data = json.loads(payload)
             except:
                 continue
 
+            # 记录第一次成功响应（以成功解析到 JSON 为准）
+            if not state["success_recorded"]:
+                if credential_name and credential_manager:
+                    await credential_manager.record_api_call_result(
+                        credential_name, True, is_antigravity=True
+                    )
+                state["success_recorded"] = True
+
             # 提取 parts
-            parts = data.get("response", {}).get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            response_obj = data.get("response", {}) if isinstance(data, dict) else {}
+            candidates = response_obj.get("candidates", []) if isinstance(response_obj, dict) else []
+            first_candidate = candidates[0] if candidates else {}
+            parts = first_candidate.get("content", {}).get("parts", []) if isinstance(first_candidate, dict) else []
+
+            # 记录 usage / finishReason（可能只在最后出现，也可能在中途就出现）
+            usage_metadata = response_obj.get("usageMetadata") if isinstance(response_obj, dict) else None
+            if isinstance(usage_metadata, dict):
+                state["last_usage_metadata"] = usage_metadata
+
+            finish_reason = first_candidate.get("finishReason") if isinstance(first_candidate, dict) else None
+            if finish_reason:
+                state["last_finish_reason"] = finish_reason
 
             for part in parts:
                 # 处理思考内容
@@ -560,8 +640,7 @@ async def convert_antigravity_stream_to_openai(
                     state["tool_calls"].append(tool_call)
 
             # 检查是否结束
-            finish_reason = data.get("response", {}).get("candidates", [{}])[0].get("finishReason")
-            if finish_reason:
+            if finish_reason and not state["final_sent"]:
                 # 如果只有思考内容，没有任何可见 content，补一个占位，避免部分前端显示空消息
                 if state["emitted_reasoning"] and not state["emitted_content"] and not state["tool_calls"]:
                     yield emit_delta({"content": "[模型正在思考中，请稍后再试或重新提问]"})
@@ -570,36 +649,22 @@ async def convert_antigravity_stream_to_openai(
                 if state["tool_calls"]:
                     yield emit_delta({"tool_calls": state["tool_calls"]})
 
-                # 发送使用统计
-                usage_metadata = data.get("response", {}).get("usageMetadata", {})
-                usage = {
-                    "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
-                    "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
-                    "total_tokens": usage_metadata.get("totalTokenCount", 0)
-                }
-
-                # 确定 finish_reason
-                openai_finish_reason = "stop"
-                if state["tool_calls"]:
-                    openai_finish_reason = "tool_calls"
-                elif finish_reason == "MAX_TOKENS":
-                    openai_finish_reason = "length"
-
-                chunk = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": openai_finish_reason
-                    }],
-                    "usage": usage
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+                yield emit_final_chunk(finish_reason, state.get("last_usage_metadata"))
+                state["final_sent"] = True
+                break
 
         # 发送结束标记
+        if not state["final_sent"]:
+            # 上游没有给出 finishReason，也要补齐 final chunk，避免中转平台无法 message_stop
+            if state["emitted_reasoning"] and not state["emitted_content"] and not state["tool_calls"]:
+                yield emit_delta({"content": "[模型正在思考中，请稍后再试或重新提问]"})
+
+            if state["tool_calls"]:
+                yield emit_delta({"tool_calls": state["tool_calls"]})
+
+            yield emit_final_chunk(state.get("last_finish_reason"), state.get("last_usage_metadata"))
+            state["final_sent"] = True
+
         yield "data: [DONE]\n\n"
 
     except Exception as e:
