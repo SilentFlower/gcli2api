@@ -468,6 +468,7 @@ async def convert_antigravity_stream_to_openai(
         "tool_calls": [],
         "emitted_content": False,
         "emitted_reasoning": False,
+        "sent_role": False,
         "success_recorded": False
     }
 
@@ -487,6 +488,12 @@ async def convert_antigravity_stream_to_openai(
                 }]
             }
             return f"data: {json.dumps(chunk)}\n\n"
+
+        # Claude Code 等部分客户端对 OpenAI 流式格式更严格：
+        # 如果从未发送过 delta.role=assistant，客户端可能不会创建消息容器，导致最终显示为空。
+        if not state["sent_role"]:
+            state["sent_role"] = True
+            yield build_delta_chunk({"role": "assistant"})
 
         async for line in response.aiter_lines():
             if not line or not line.startswith("data: "):
