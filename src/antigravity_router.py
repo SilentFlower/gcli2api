@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -50,6 +50,44 @@ async def authenticate(credentials: HTTPAuthorizationCredentials = Depends(secur
     if token != password:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="密码错误")
     return token
+
+
+async def authenticate_flexible(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+    x_goog_api_key: Optional[str] = Header(None, alias="x-goog-api-key"),
+    key: Optional[str] = Query(None),
+) -> str:
+    """
+    灵活验证：支持多种常见鉴权方式。
+
+    用途：`/antigravity/v1/messages` 常被 Anthropic/Claude 客户端直接调用，
+    这类客户端默认使用 `x-api-key` 而非 `Authorization: Bearer ...`。
+    """
+    from config import get_api_password
+
+    password = await get_api_password()
+
+    # 1) URL 参数 key（兼容 Gemini/部分反代）
+    if key and key == password:
+        return key
+
+    # 2) Anthropic 标准：x-api-key
+    if x_api_key and x_api_key == password:
+        return x_api_key
+
+    # 3) Gemini 标准：x-goog-api-key
+    if x_goog_api_key and x_goog_api_key == password:
+        return x_goog_api_key
+
+    # 4) 兼容：Authorization: Bearer <token>
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if token == password:
+            return token
+
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authenticated")
 
 
 # 模型名称映射
@@ -1470,7 +1508,7 @@ async def chat_completions(request: Request, token: str = Depends(authenticate))
 
 
 @router.post("/antigravity/v1/messages")
-async def messages(request: Request, token: str = Depends(authenticate)):
+async def messages(request: Request, token: str = Depends(authenticate_flexible)):
     """
     Anthropic/Claude Messages 兼容端点（直接输出 Claude SSE 协议）。
 
