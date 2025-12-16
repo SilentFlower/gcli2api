@@ -222,50 +222,163 @@ def convert_openai_tools_to_antigravity(tools: Optional[List[Any]]) -> Optional[
     if not tools:
         return None
 
-    # 需要排除的字段
-    EXCLUDED_KEYS = {'$schema', 'additionalProperties', 'minLength', 'maxLength',
-                     'minItems', 'maxItems', 'uniqueItems'}
+    # Antigravity/Gemini 对 functionDeclarations.parameters 的 Schema 支持较严格：
+    # - 不支持许多 JSON Schema/OpenAPI 关键字（会触发 400: Unknown name）
+    # - "type"、"items" 等字段在某些生成器里可能是数组形式（会触发 400: cannot start list）
+    # 这里采用“兼容优先”的最小降级策略：尽量清理/归一化，保证请求可发送。
+    EXCLUDED_KEYS = {
+        # 项目原有排除项
+        "$schema",
+        "additionalProperties",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        # Gemini 侧已知不支持项（参考 src/openai_transfer.py 的清理逻辑）
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "title",
+        "example",
+        "examples",
+        "readOnly",
+        "writeOnly",
+        "default",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "const",
+        "additionalItems",
+        "contains",
+        "patternProperties",
+        "dependencies",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+        "contentEncoding",
+        "contentMediaType",
+    }
 
-    def clean_parameters(obj):
-        """递归清理参数对象"""
+    def _normalize_type_field(cleaned: Dict[str, Any], path: str) -> None:
+        schema_type = cleaned.get("type")
+        if not isinstance(schema_type, list):
+            return
+
+        # 兼容 ["string", "null"] 这类可空写法
+        nullable = "null" in schema_type
+        non_null_types = [t for t in schema_type if t != "null"]
+        chosen_type = non_null_types[0] if non_null_types else (schema_type[0] if schema_type else None)
+
+        if chosen_type is None:
+            cleaned.pop("type", None)
+        else:
+            cleaned["type"] = chosen_type
+
+        if nullable and "nullable" not in cleaned:
+            cleaned["nullable"] = True
+
+        log.warning(f"[ANTIGRAVITY][TOOLS] Schema 字段 type 为数组，已降级处理: {path}.type -> {cleaned.get('type')}, nullable={cleaned.get('nullable')}")
+
+    def _normalize_items_field(cleaned: Dict[str, Any], path: str) -> None:
+        items = cleaned.get("items")
+        if not isinstance(items, list):
+            return
+
+        # 兼容 tuple validation: items 是数组（多 schema），Antigravity/Gemini 通常不支持
+        if items:
+            cleaned["items"] = items[0]
+            log.warning(f"[ANTIGRAVITY][TOOLS] Schema 字段 items 为数组，已取第一个元素降级: {path}.items[0]")
+        else:
+            cleaned.pop("items", None)
+            log.warning(f"[ANTIGRAVITY][TOOLS] Schema 字段 items 为空数组，已移除: {path}.items")
+
+    def clean_parameters(obj: Any, path: str = "parameters") -> Any:
+        """递归清理并归一化参数 schema（兼容优先的最小降级策略）"""
         if isinstance(obj, dict):
-            cleaned = {}
+            cleaned: Dict[str, Any] = {}
             for key, value in obj.items():
                 if key in EXCLUDED_KEYS:
                     continue
-                cleaned[key] = clean_parameters(value)
+                cleaned[key] = clean_parameters(value, f"{path}.{key}")
+
+            # 归一化：修复 type/items 出现数组导致的 proto 解析错误
+            _normalize_type_field(cleaned, path)
+            _normalize_items_field(cleaned, path)
+
+            # 归一化：properties 必须是对象
+            if "properties" in cleaned and not isinstance(cleaned["properties"], dict):
+                log.warning(f"[ANTIGRAVITY][TOOLS] Schema 字段 properties 非对象，已移除: {path}.properties")
+                cleaned.pop("properties", None)
+
+            # 归一化：required 必须是字符串数组
+            if "required" in cleaned:
+                if isinstance(cleaned["required"], list):
+                    cleaned["required"] = [r for r in cleaned["required"] if isinstance(r, str)]
+                else:
+                    log.warning(f"[ANTIGRAVITY][TOOLS] Schema 字段 required 非数组，已移除: {path}.required")
+                    cleaned.pop("required", None)
+
+            # 兜底：如果有 properties/items 但没有 type，补齐 type
+            if "properties" in cleaned and "type" not in cleaned:
+                cleaned["type"] = "object"
+            if "items" in cleaned and "type" not in cleaned:
+                cleaned["type"] = "array"
+
             return cleaned
-        elif isinstance(obj, list):
-            return [clean_parameters(item) for item in obj]
-        else:
-            return obj
+
+        if isinstance(obj, list):
+            return [clean_parameters(item, f"{path}[]") for item in obj]
+
+        return obj
 
     function_declarations = []
 
     for tool in tools:
-        tool_type = getattr(tool, "type", "function")
-        if tool_type == "function":
-            function = getattr(tool, "function", None)
-            if function:
-                func_name = function.get("name")
-                assert func_name is not None, "Function name is required"
-                func_desc = function.get("description", "")
-                func_params = function.get("parameters", {})
+        # 兼容：tool 可能是 Pydantic 模型或 dict
+        if hasattr(tool, "model_dump"):
+            tool_dict = tool.model_dump()
+        elif hasattr(tool, "dict"):
+            tool_dict = tool.dict()
+        else:
+            tool_dict = tool
 
-                # 转换为字典（如果是 Pydantic 模型）
-                if hasattr(func_params, "dict"):
-                    func_params = func_params.dict()
-                elif hasattr(func_params, "model_dump"):
-                    func_params = func_params.model_dump()
+        if not isinstance(tool_dict, dict):
+            log.warning(f"[ANTIGRAVITY][TOOLS] 无法解析 tool 定义（非对象），已跳过: {type(tool_dict)}")
+            continue
 
-                # 清理参数
-                cleaned_params = clean_parameters(func_params)
+        tool_type = tool_dict.get("type", "function")
+        if tool_type != "function":
+            continue
 
-                function_declarations.append({
-                    "name": func_name,
-                    "description": func_desc,
-                    "parameters": cleaned_params
-                })
+        function = tool_dict.get("function")
+        if not isinstance(function, dict):
+            log.warning("[ANTIGRAVITY][TOOLS] tool.function 缺失或非对象，已跳过")
+            continue
+
+        func_name = function.get("name")
+        assert func_name is not None, "Function name is required"
+        func_desc = function.get("description", "")
+        func_params = function.get("parameters", {})
+
+        # 转换为字典（如果是 Pydantic 模型）
+        if hasattr(func_params, "dict"):
+            func_params = func_params.dict()
+        elif hasattr(func_params, "model_dump"):
+            func_params = func_params.model_dump()
+
+        # 清理参数
+        cleaned_params = clean_parameters(func_params, f"parameters({func_name})")
+
+        function_declarations.append({
+            "name": func_name,
+            "description": func_desc,
+            "parameters": cleaned_params
+        })
 
     if function_declarations:
         return [{"functionDeclarations": function_declarations}]
