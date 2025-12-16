@@ -489,11 +489,18 @@ async def convert_antigravity_stream_to_openai(
             }
             return f"data: {json.dumps(chunk)}\n\n"
 
-        # Claude Code 等部分客户端对 OpenAI 流式格式更严格：
-        # 如果从未发送过 delta.role=assistant，客户端可能不会创建消息容器，导致最终显示为空。
-        if not state["sent_role"]:
-            state["sent_role"] = True
-            yield build_delta_chunk({"role": "assistant"})
+        def emit_delta(delta: Dict[str, Any]) -> str:
+            """
+            兼容性输出：
+            - 一些 OpenAI→Anthropic 转换器/客户端会严格要求 delta 中存在 content 字段（可为空字符串）
+            - 也可能要求首个“有效 chunk”携带 role=assistant 才会创建消息容器
+            """
+            if not state["sent_role"]:
+                delta = {"role": "assistant", **delta}
+                state["sent_role"] = True
+            if "content" not in delta:
+                delta = {**delta, "content": ""}
+            return build_delta_chunk(delta)
 
         async for line in response.aiter_lines():
             if not line or not line.startswith("data: "):
@@ -520,7 +527,7 @@ async def convert_antigravity_stream_to_openai(
                     reasoning_text = part.get("text", "")
                     if reasoning_text:
                         state["emitted_reasoning"] = True
-                        yield build_delta_chunk({"reasoning_content": reasoning_text})
+                        yield emit_delta({"reasoning_content": reasoning_text})
 
                 # 处理图片数据 (inlineData)
                 elif "inlineData" in part:
@@ -534,7 +541,7 @@ async def convert_antigravity_stream_to_openai(
                     state["emitted_content"] = True
 
                     # 发送图片块
-                    yield build_delta_chunk({"content": image_markdown})
+                    yield emit_delta({"content": image_markdown})
 
                 # 处理普通文本
                 elif "text" in part:
@@ -545,7 +552,7 @@ async def convert_antigravity_stream_to_openai(
 
                     # 发送文本块
                     if text:
-                        yield build_delta_chunk({"content": text})
+                        yield emit_delta({"content": text})
 
                 # 处理工具调用
                 elif "functionCall" in part:
@@ -557,22 +564,11 @@ async def convert_antigravity_stream_to_openai(
             if finish_reason:
                 # 如果只有思考内容，没有任何可见 content，补一个占位，避免部分前端显示空消息
                 if state["emitted_reasoning"] and not state["emitted_content"] and not state["tool_calls"]:
-                    yield build_delta_chunk({"content": "[模型正在思考中，请稍后再试或重新提问]"})
+                    yield emit_delta({"content": "[模型正在思考中，请稍后再试或重新提问]"})
 
                 # 发送工具调用
                 if state["tool_calls"]:
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"tool_calls": state["tool_calls"]},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield emit_delta({"tool_calls": state["tool_calls"]})
 
                 # 发送使用统计
                 usage_metadata = data.get("response", {}).get("usageMetadata", {})
