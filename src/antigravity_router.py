@@ -465,17 +465,16 @@ async def convert_antigravity_stream_to_openai(
 
     """
     state = {
-        "thinking_started": False,
         "tool_calls": [],
-        "content_buffer": "",
-        "thinking_buffer": "",
+        "emitted_content": False,
+        "emitted_reasoning": False,
         "success_recorded": False
     }
 
     created = int(time.time())
 
     try:
-        def build_content_chunk(content: str) -> str:
+        def build_delta_chunk(delta: Dict[str, Any]) -> str:
             chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -483,21 +482,11 @@ async def convert_antigravity_stream_to_openai(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": content},
+                    "delta": delta,
                     "finish_reason": None
                 }]
             }
             return f"data: {json.dumps(chunk)}\n\n"
-
-        def flush_thinking_buffer() -> Optional[str]:
-            if not state["thinking_started"]:
-                return None
-            state["thinking_buffer"] += "\n</think>\n"
-            thinking_block = state["thinking_buffer"]
-            state["content_buffer"] += thinking_block
-            state["thinking_buffer"] = ""
-            state["thinking_started"] = False
-            return thinking_block
 
         async for line in response.aiter_lines():
             if not line or not line.startswith("data: "):
@@ -521,18 +510,13 @@ async def convert_antigravity_stream_to_openai(
             for part in parts:
                 # 处理思考内容
                 if part.get("thought") is True:
-                    if not state["thinking_started"]:
-                        state["thinking_buffer"] = "<think>\n"
-                        state["thinking_started"] = True
-                    state["thinking_buffer"] += part.get("text", "")
+                    reasoning_text = part.get("text", "")
+                    if reasoning_text:
+                        state["emitted_reasoning"] = True
+                        yield build_delta_chunk({"reasoning_content": reasoning_text})
 
                 # 处理图片数据 (inlineData)
                 elif "inlineData" in part:
-                    # 如果之前在思考，先结束思考
-                    thinking_block = flush_thinking_buffer()
-                    if thinking_block:
-                        yield build_content_chunk(thinking_block)
-
                     # 提取图片数据
                     inline_data = part["inlineData"]
                     mime_type = inline_data.get("mimeType", "image/png")
@@ -540,46 +524,21 @@ async def convert_antigravity_stream_to_openai(
 
                     # 转换为 Markdown 格式的图片
                     image_markdown = f"\n\n![生成的图片](data:{mime_type};base64,{base64_data})\n\n"
-                    state["content_buffer"] += image_markdown
+                    state["emitted_content"] = True
 
                     # 发送图片块
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": image_markdown},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    yield build_delta_chunk({"content": image_markdown})
 
                 # 处理普通文本
                 elif "text" in part:
-                    # 如果之前在思考，先结束思考
-                    thinking_block = flush_thinking_buffer()
-                    if thinking_block:
-                        yield build_content_chunk(thinking_block)
-
                     # 添加文本内容
                     text = part.get("text", "")
-                    state["content_buffer"] += text
+                    if text:
+                        state["emitted_content"] = True
 
                     # 发送文本块
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": text},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    if text:
+                        yield build_delta_chunk({"content": text})
 
                 # 处理工具调用
                 elif "functionCall" in part:
@@ -589,9 +548,9 @@ async def convert_antigravity_stream_to_openai(
             # 检查是否结束
             finish_reason = data.get("response", {}).get("candidates", [{}])[0].get("finishReason")
             if finish_reason:
-                thinking_block = flush_thinking_buffer()
-                if thinking_block:
-                    yield build_content_chunk(thinking_block)
+                # 如果只有思考内容，没有任何可见 content，补一个占位，避免部分前端显示空消息
+                if state["emitted_reasoning"] and not state["emitted_content"] and not state["tool_calls"]:
+                    yield build_delta_chunk({"content": "[模型正在思考中，请稍后再试或重新提问]"})
 
                 # 发送工具调用
                 if state["tool_calls"]:
@@ -698,15 +657,18 @@ def convert_antigravity_response_to_openai(
         elif "functionCall" in part:
             tool_calls.append(convert_to_openai_tool_call(part["functionCall"]))
 
-    # 拼接思考内容
-    if thinking_content:
-        content = f"<think>\n{thinking_content}\n</think>\n{content}"
+    # 仅当没有正常内容但有思考内容时，补一个占位，避免部分前端显示空消息
+    if not content and thinking_content and not tool_calls:
+        content = "[模型正在思考中，请稍后再试或重新提问]"
 
     # 构建 OpenAI 响应
     message = {
         "role": "assistant",
         "content": content
     }
+
+    if thinking_content:
+        message["reasoning_content"] = thinking_content
 
     if tool_calls:
         message["tool_calls"] = tool_calls
