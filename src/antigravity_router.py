@@ -537,6 +537,13 @@ async def convert_antigravity_stream_to_openai(
             elif finish_reason_raw == "MAX_TOKENS":
                 openai_finish_reason = "length"
 
+            # 兼容性：部分 OpenAI→Anthropic 中转会依赖 delta.content（哪怕是空字符串）
+            # 来触发 block/message 的收尾；同时若此前从未发送过 role，也在最终块补上。
+            final_delta: Dict[str, Any] = {"content": ""}
+            if not state["sent_role"]:
+                final_delta = {"role": "assistant", **final_delta}
+                state["sent_role"] = True
+
             chunk: Dict[str, Any] = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -545,7 +552,7 @@ async def convert_antigravity_stream_to_openai(
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {},
+                        "delta": final_delta,
                         "finish_reason": openai_finish_reason,
                     }
                 ],
