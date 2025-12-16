@@ -123,6 +123,149 @@ def extract_images_from_content(content: Any) -> Dict[str, Any]:
     return result
 
 
+def extract_images_from_anthropic_content(content: Any) -> Dict[str, Any]:
+    """
+    从 Anthropic Messages 的 content 中提取文本和图片。
+
+    Anthropic 常见形态：
+    - content 是字符串
+    - content 是数组，元素可能为：
+      - {"type":"text","text":"..."}
+      - {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+    """
+    result = {"text": "", "images": []}
+
+    if isinstance(content, str):
+        result["text"] = content
+        return result
+
+    if not isinstance(content, list):
+        return result
+
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            result["text"] += item.get("text", "")
+            continue
+
+        if item_type == "image":
+            source = item.get("source", {})
+            if not isinstance(source, dict):
+                continue
+            if source.get("type") != "base64":
+                continue
+
+            media_type = source.get("media_type") or source.get("mediaType") or "image/png"
+            base64_data = source.get("data", "")
+            if base64_data:
+                result["images"].append(
+                    {"inlineData": {"mimeType": media_type, "data": base64_data}}
+                )
+
+    return result
+
+
+def anthropic_system_to_text(system: Any) -> str:
+    """
+    将 Anthropic 的 system 字段归一化为纯文本。
+
+    Anthropic 允许：
+    - system: "..."
+    - system: [{"type":"text","text":"..."}]
+    """
+    if system is None:
+        return ""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        text_parts: List[str] = []
+        for item in system:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        return "".join(text_parts)
+    return ""
+
+
+def anthropic_messages_to_antigravity_contents(
+    messages: List[Any], system: Any = None
+) -> List[Dict[str, Any]]:
+    """
+    将 Anthropic Messages 格式转换为 Antigravity contents 格式。
+    """
+    contents: List[Dict[str, Any]] = []
+
+    system_text = anthropic_system_to_text(system)
+    system_injected = False
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if role == "user":
+            parts: List[Dict[str, Any]] = []
+
+            # 兼容策略：将 system 合并到第一条 user 消息
+            if system_text and not system_injected:
+                parts.append({"text": system_text})
+                system_injected = True
+
+            extracted = extract_images_from_anthropic_content(content)
+            if extracted["text"]:
+                parts.append({"text": extracted["text"]})
+            parts.extend(extracted["images"])
+
+            if parts:
+                contents.append({"role": "user", "parts": parts})
+
+        elif role == "assistant":
+            parts = []
+            extracted = extract_images_from_anthropic_content(content)
+            if extracted["text"]:
+                parts.append({"text": extracted["text"]})
+            parts.extend(extracted["images"])
+
+            if parts:
+                contents.append({"role": "model", "parts": parts})
+
+    return contents
+
+
+def convert_anthropic_tools_to_openai_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
+    """
+    将 Anthropic tools 转为 OpenAI tools 形态，复用现有的 schema 清理与转换逻辑。
+
+    Anthropic 常见形态：
+    - {"name":"...","description":"...","input_schema":{...}}
+    """
+    if not isinstance(tools, list) or not tools:
+        return None
+
+    openai_tools: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        openai_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", "") or "",
+                    "parameters": tool.get("input_schema", {}) or {},
+                },
+            }
+        )
+    return openai_tools if openai_tools else None
+
+
 def openai_messages_to_antigravity_contents(messages: List[Any]) -> List[Dict[str, Any]]:
     """
     将 OpenAI 消息格式转换为 Antigravity contents 格式
@@ -696,6 +839,403 @@ async def convert_antigravity_stream_to_openai(
             log.debug(f"[ANTIGRAVITY] Error closing client: {e}")
 
 
+def _anthropic_sse_event(event: str, data: Dict[str, Any]) -> str:
+    """构造 Anthropic/Claude Messages SSE 事件。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _map_antigravity_finish_reason_to_anthropic(finish_reason: Any, has_tool_use: bool) -> str:
+    """将 Antigravity/Gemini 的 finishReason 映射到 Anthropic stop_reason。"""
+    if has_tool_use:
+        return "tool_use"
+    if finish_reason == "MAX_TOKENS":
+        return "max_tokens"
+    # Gemini/Antigravity 还有 STOP/SAFETY 等，这里先按 end_turn 兜底
+    return "end_turn"
+
+
+def convert_antigravity_response_to_anthropic(
+    response_data: Dict[str, Any],
+    model: str,
+    message_id: str,
+) -> Dict[str, Any]:
+    """
+    将 Antigravity 非流式响应转换为 Anthropic Messages 格式。
+    """
+    parts = (
+        response_data.get("response", {})
+        .get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+
+    thinking_text = ""
+    text_content = ""
+    tool_uses: List[Dict[str, Any]] = []
+
+    for part in parts:
+        if part.get("thought") is True:
+            thinking_text += part.get("text", "")
+            continue
+
+        if "inlineData" in part:
+            inline_data = part["inlineData"]
+            mime_type = inline_data.get("mimeType", "image/png")
+            base64_data = inline_data.get("data", "")
+            if base64_data:
+                text_content += f"\n\n![生成的图片](data:{mime_type};base64,{base64_data})\n\n"
+            continue
+
+        if "text" in part:
+            text_content += part.get("text", "")
+            continue
+
+        if "functionCall" in part:
+            function_call = part.get("functionCall", {})
+            if isinstance(function_call, dict):
+                tool_uses.append(
+                    {
+                        "type": "tool_use",
+                        "id": function_call.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                        "name": function_call.get("name", "") or "",
+                        "input": function_call.get("args", {}) or {},
+                    }
+                )
+            continue
+
+    content_blocks: List[Dict[str, Any]] = []
+    if thinking_text:
+        content_blocks.append(
+            {
+                "type": "thinking",
+                "thinking": thinking_text,
+                "signature": "",
+            }
+        )
+
+    if tool_uses:
+        content_blocks.extend(tool_uses)
+
+    if text_content:
+        content_blocks.append({"type": "text", "text": text_content})
+
+    finish_reason_raw = (
+        response_data.get("response", {})
+        .get("candidates", [{}])[0]
+        .get("finishReason")
+    )
+
+    usage_metadata = response_data.get("response", {}).get("usageMetadata", {}) or {}
+    input_tokens = usage_metadata.get("promptTokenCount", 0) or 0
+    output_tokens = usage_metadata.get("candidatesTokenCount", 0) or 0
+
+    stop_reason = _map_antigravity_finish_reason_to_anthropic(
+        finish_reason_raw, has_tool_use=bool(tool_uses)
+    )
+
+    return {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": output_tokens,
+        },
+    }
+
+
+async def convert_antigravity_stream_to_anthropic(
+    response: Any,
+    stream_ctx: Any,
+    client: Any,
+    model: str,
+    message_id: str,
+    credential_manager: Any,
+    credential_name: str,
+):
+    """
+    将 Antigravity 流式响应转换为 Anthropic Messages SSE。
+
+    目标：输出完整的 message_start/content_block_*/message_delta/message_stop，
+    避免依赖中转平台的 OpenAI→Anthropic 转换导致的渲染/收尾缺失问题。
+    """
+    state = {
+        "success_recorded": False,
+        "thinking_index": None,
+        "text_index": None,
+        "next_index": 0,
+        "has_tool_use": False,
+        "last_finish_reason": None,
+        "last_usage_metadata": None,
+        "thinking_open": False,
+        "text_open": False,
+    }
+
+    # message_start
+    yield _anthropic_sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        },
+    )
+
+    def _extract_sse_data_payload(line: str) -> str:
+        if not line or not line.startswith("data:"):
+            return ""
+        payload = line[len("data:") :]
+        if payload.startswith(" "):
+            payload = payload[1:]
+        return payload
+
+    def _ensure_thinking_block_started():
+        if state["thinking_index"] is None:
+            state["thinking_index"] = state["next_index"]
+            state["next_index"] += 1
+        idx = state["thinking_index"]
+        if not state["thinking_open"]:
+            state["thinking_open"] = True
+            yield _anthropic_sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                },
+            )
+
+    def _ensure_text_block_started():
+        if state["text_index"] is None:
+            state["text_index"] = state["next_index"]
+            state["next_index"] += 1
+        idx = state["text_index"]
+        if not state["text_open"]:
+            state["text_open"] = True
+            yield _anthropic_sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+        # 不返回值：调用侧直接从 state["text_index"] 读取 index
+
+    try:
+        async for line in response.aiter_lines():
+            payload = _extract_sse_data_payload(line)
+            if not payload:
+                continue
+
+            if payload.strip() == "[DONE]":
+                break
+
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+
+            # 记录第一次成功响应（以成功解析到 JSON 为准）
+            if not state["success_recorded"]:
+                if credential_name and credential_manager:
+                    await credential_manager.record_api_call_result(
+                        credential_name, True, is_antigravity=True
+                    )
+                state["success_recorded"] = True
+
+            response_obj = data.get("response", {}) if isinstance(data, dict) else {}
+            candidates = response_obj.get("candidates", []) if isinstance(response_obj, dict) else []
+            first_candidate = candidates[0] if candidates else {}
+            parts = (
+                first_candidate.get("content", {}).get("parts", [])
+                if isinstance(first_candidate, dict)
+                else []
+            )
+
+            usage_metadata = response_obj.get("usageMetadata") if isinstance(response_obj, dict) else None
+            if isinstance(usage_metadata, dict):
+                state["last_usage_metadata"] = usage_metadata
+
+            finish_reason = first_candidate.get("finishReason") if isinstance(first_candidate, dict) else None
+            if finish_reason:
+                state["last_finish_reason"] = finish_reason
+
+            for part in parts:
+                if part.get("thought") is True:
+                    reasoning_text = part.get("text", "")
+                    if reasoning_text:
+                        # 开启 thinking block
+                        for evt in _ensure_thinking_block_started():
+                            yield evt
+                        idx = state["thinking_index"]
+                        yield _anthropic_sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "thinking_delta", "thinking": reasoning_text},
+                            },
+                        )
+                    continue
+
+                if "inlineData" in part:
+                    inline_data = part["inlineData"]
+                    mime_type = inline_data.get("mimeType", "image/png")
+                    base64_data = inline_data.get("data", "")
+                    if base64_data:
+                        image_markdown = f"\n\n![生成的图片](data:{mime_type};base64,{base64_data})\n\n"
+                        if state["thinking_open"] and state["thinking_index"] is not None:
+                            yield _anthropic_sse_event(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": state["thinking_index"]},
+                            )
+                            state["thinking_open"] = False
+                        for evt in _ensure_text_block_started():
+                            yield evt
+                        idx = state["text_index"]
+                        yield _anthropic_sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "text_delta", "text": image_markdown},
+                            },
+                        )
+                    continue
+
+                if "text" in part:
+                    text = part.get("text", "")
+                    if text:
+                        # 兼容：在开始输出 text 之前，先结束 thinking block（若存在）
+                        if state["thinking_open"] and state["thinking_index"] is not None:
+                            yield _anthropic_sse_event(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": state["thinking_index"]},
+                            )
+                            state["thinking_open"] = False
+
+                        for evt in _ensure_text_block_started():
+                            yield evt
+                        idx = state["text_index"]
+                        yield _anthropic_sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "text_delta", "text": text},
+                            },
+                        )
+                    continue
+
+                if "functionCall" in part:
+                    # 以完整 tool_use block 形式一次性输出（简化流式 tool delta）
+                    function_call = part.get("functionCall", {})
+                    if isinstance(function_call, dict):
+                        if state["thinking_open"] and state["thinking_index"] is not None:
+                            yield _anthropic_sse_event(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": state["thinking_index"]},
+                            )
+                            state["thinking_open"] = False
+                        state["has_tool_use"] = True
+                        tool_index = state["next_index"]
+                        state["next_index"] += 1
+
+                        tool_use_block = {
+                            "type": "tool_use",
+                            "id": function_call.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                            "name": function_call.get("name", "") or "",
+                            "input": function_call.get("args", {}) or {},
+                        }
+                        yield _anthropic_sse_event(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": tool_index,
+                                "content_block": tool_use_block,
+                            },
+                        )
+                        yield _anthropic_sse_event(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": tool_index},
+                        )
+                    continue
+
+            if finish_reason:
+                break
+
+        # 收尾：停止已开启的 blocks
+        if state["thinking_open"] and state["thinking_index"] is not None:
+            yield _anthropic_sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": state["thinking_index"]},
+            )
+            state["thinking_open"] = False
+
+        if state["text_open"] and state["text_index"] is not None:
+            yield _anthropic_sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": state["text_index"]},
+            )
+            state["text_open"] = False
+
+        usage_metadata = state.get("last_usage_metadata") or {}
+        output_tokens = usage_metadata.get("candidatesTokenCount", 0) if isinstance(usage_metadata, dict) else 0
+        stop_reason = _map_antigravity_finish_reason_to_anthropic(
+            state.get("last_finish_reason"), has_tool_use=bool(state.get("has_tool_use"))
+        )
+
+        yield _anthropic_sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens or 0},
+            },
+        )
+
+        yield _anthropic_sse_event("message_stop", {"type": "message_stop"})
+
+    except Exception as e:
+        log.error(f"[ANTIGRAVITY] Anthropic streaming error: {e}")
+        yield _anthropic_sse_event(
+            "error",
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)},
+            },
+        )
+    finally:
+        try:
+            await stream_ctx.__aexit__(None, None, None)
+        except Exception as e:
+            log.debug(f"[ANTIGRAVITY] Error closing stream context: {e}")
+        try:
+            await client.aclose()
+        except Exception as e:
+            log.debug(f"[ANTIGRAVITY] Error closing client: {e}")
+
+
 def convert_antigravity_response_to_openai(
     response_data: Dict[str, Any],
     model: str,
@@ -926,4 +1466,135 @@ async def chat_completions(request: Request, token: str = Depends(authenticate))
 
     except Exception as e:
         log.error(f"[ANTIGRAVITY] Request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
+
+
+@router.post("/antigravity/v1/messages")
+async def messages(request: Request, token: str = Depends(authenticate)):
+    """
+    Anthropic/Claude Messages 兼容端点（直接输出 Claude SSE 协议）。
+
+    用途：避免依赖外部中转平台进行 OpenAI→Anthropic 转换时出现的收尾缺失问题。
+    """
+    try:
+        raw_data = await request.json()
+    except Exception as e:
+        log.error(f"Failed to parse JSON request: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    if not isinstance(raw_data, dict):
+        raise HTTPException(status_code=400, detail="Invalid request body")
+
+    model = raw_data.get("model")
+    messages_payload = raw_data.get("messages", [])
+    system = raw_data.get("system", None)
+    stream = bool(raw_data.get("stream", False))
+    tools = raw_data.get("tools", None)
+
+    if not model or not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'model'")
+    if not isinstance(messages_payload, list):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'messages'")
+
+    # 健康检查：messages=[{"role":"user","content":"Hi"}]
+    if (
+        len(messages_payload) == 1
+        and isinstance(messages_payload[0], dict)
+        and messages_payload[0].get("role") == "user"
+        and messages_payload[0].get("content") == "Hi"
+    ):
+        message_id = f"msg_ag_{uuid.uuid4().hex[:24]}"
+        return JSONResponse(
+            content={
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": "antigravity messages API 正常工作中"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            }
+        )
+
+    # 获取凭证管理器
+    from src.credential_manager import get_credential_manager
+
+    cred_mgr = await get_credential_manager()
+
+    # 模型映射与 thinking 判定
+    actual_model = model_mapping(model)
+    enable_thinking = is_thinking_model(model)
+    log.info(
+        f"[ANTIGRAVITY][MESSAGES] Request: model={model} -> {actual_model}, stream={stream}, thinking={enable_thinking}"
+    )
+
+    # 转换 Anthropic messages -> Antigravity contents
+    try:
+        contents = anthropic_messages_to_antigravity_contents(messages_payload, system=system)
+    except Exception as e:
+        log.error(f"Failed to convert anthropic messages: {e}")
+        raise HTTPException(status_code=500, detail=f"Message conversion failed: {str(e)}")
+
+    # tools: Anthropic -> OpenAI -> Antigravity
+    openai_tools = convert_anthropic_tools_to_openai_tools(tools)
+    antigravity_tools = convert_openai_tools_to_antigravity(openai_tools)
+
+    # generationConfig
+    parameters = {
+        "temperature": raw_data.get("temperature", None),
+        "top_p": raw_data.get("top_p", None),
+        "max_tokens": raw_data.get("max_tokens", None),
+    }
+    parameters = {k: v for k, v in parameters.items() if v is not None}
+    generation_config = generate_generation_config(parameters, enable_thinking, actual_model)
+
+    # 获取 projectId / sessionId
+    cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
+    if not cred_result:
+        log.error("当前无可用 antigravity 凭证")
+        raise HTTPException(status_code=500, detail="当前无可用 antigravity 凭证")
+    _, credential_data = cred_result
+    project_id = credential_data.get("projectId", "default-project")
+    session_id = credential_data.get("sessionId", f"session-{uuid.uuid4().hex}")
+
+    request_body = build_antigravity_request_body(
+        contents=contents,
+        model=actual_model,
+        project_id=project_id,
+        session_id=session_id,
+        tools=antigravity_tools,
+        generation_config=generation_config,
+    )
+
+    message_id = f"msg_ag_{uuid.uuid4().hex[:24]}"
+
+    try:
+        if stream:
+            resources, cred_name, _cred_data = await send_antigravity_request_stream(
+                request_body, cred_mgr
+            )
+            response, stream_ctx, client = resources
+            return StreamingResponse(
+                convert_antigravity_stream_to_anthropic(
+                    response, stream_ctx, client, model, message_id, cred_mgr, cred_name
+                ),
+                media_type="text/event-stream",
+            )
+
+        response_data, _cred_name, _cred_data = await send_antigravity_request_no_stream(
+            request_body, cred_mgr
+        )
+        anthropic_response = convert_antigravity_response_to_anthropic(
+            response_data, model, message_id
+        )
+        return JSONResponse(content=anthropic_response)
+
+    except Exception as e:
+        log.error(f"[ANTIGRAVITY][MESSAGES] Request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
