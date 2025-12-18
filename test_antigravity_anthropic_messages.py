@@ -319,7 +319,7 @@ def test_thinking_enabled_但无历史_thinking_blocks_不会下发_thinkingConf
     assert "thinkingConfig" in components["generation_config"]
 
 
-def test_thinking_enabled_但最后一条_assistant_不以_thinking_开头_会跳过_thinkingConfig():
+def test_thinking_enabled_但最后一条_assistant_不满足带signature的thinking起始_会自动降级_includeThoughts_false():
     payload = {
         "model": "claude-3-5-sonnet-20241022",
         "max_tokens": 128,
@@ -330,10 +330,10 @@ def test_thinking_enabled_但最后一条_assistant_不以_thinking_开头_会�
         ],
     }
     components = convert_anthropic_request_to_antigravity_components(payload)
-    assert "thinkingConfig" not in components["generation_config"]
+    assert components["generation_config"]["thinkingConfig"] == {"includeThoughts": False}
 
 
-def test_thinking_enabled_最后一条assistant以tool_use开头_会前置thinking块并仍下发thinkingConfig():
+def test_thinking_enabled_最后一条assistant以tool_use开头_但包含带signature的thinking_会稳定前置并仍下发thinkingConfig():
     payload = {
         "model": "claude-opus-4-5-20251101",
         "max_tokens": 128,
@@ -343,7 +343,10 @@ def test_thinking_enabled_最后一条assistant以tool_use开头_会前置thinki
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "a"}}
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "a"}},
+                    # 模拟部分客户端把 thinking 放在 tool_use 之后导致下游 400 的场景；
+                    # 服务端会把“带 signature 的 thinking”稳定前置以满足校验。
+                    {"type": "thinking", "thinking": "t", "signature": "sig1"},
                 ],
             },
             {
@@ -365,20 +368,67 @@ def test_thinking_enabled_最后一条assistant以tool_use开头_会前置thinki
     components = convert_anthropic_request_to_antigravity_components(payload)
     assert "thinkingConfig" in components["generation_config"]
 
-    # 断言：下游 model 消息（functionCall）会以 thought 起始，避免下游“thinking enabled 时首块为 tool_use”的 400
-    tool_call_msg = None
-    for msg in components["contents"]:
-        if msg.get("role") != "model":
-            continue
-        parts = msg.get("parts") or []
-        if any(isinstance(p, dict) and "functionCall" in p for p in parts):
-            tool_call_msg = msg
-            break
 
-    assert tool_call_msg is not None
-    assert tool_call_msg["parts"][0].get("thought") is True
-    assert tool_call_msg["parts"][0].get("thoughtSignature")
-    assert tool_call_msg["parts"][1].get("functionCall", {}).get("id") == "t1"
+def test_thinking_enabled_但最后一条assistant_thinking缺少signature_会自动降级_includeThoughts_false():
+    payload = {
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 128,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "t"},
+                    {"type": "text", "text": "hello"},
+                ],
+            },
+        ],
+    }
+    components = convert_anthropic_request_to_antigravity_components(payload)
+    assert components["generation_config"]["thinkingConfig"] == {"includeThoughts": False}
+    # thinking 缺少 signature 会在消息转换时被丢弃，避免下游 signature 校验报错
+    assert components["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}, {"role": "model", "parts": [{"text": "hello"}]}]
+
+
+def test_thinking_enabled_但最后一条assistant_tool_use_且thinking缺少signature_会降级_includeThoughts_false():
+    payload = {
+        "model": "claude-opus-4-5-20251101",
+        "max_tokens": 128,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "t"},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "a"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "name": "search", "content": "ok"}],
+            },
+        ],
+        "tools": [
+            {
+                "name": "search",
+                "description": "test",
+                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }
+        ],
+    }
+
+    components = convert_anthropic_request_to_antigravity_components(payload)
+    assert components["generation_config"]["thinkingConfig"] == {"includeThoughts": False}
+    # thinking 被丢弃后，functionCall 允许作为首块（因为 includeThoughts 已降级为 false）
+    assert any(
+        msg.get("role") == "model"
+        and msg.get("parts")
+        and isinstance(msg["parts"][0], dict)
+        and "functionCall" in msg["parts"][0]
+        for msg in components["contents"]
+    )
 
 
 def test_未显式启用thinking_即使模型映射为_thinking_也不前置占位thinking块():

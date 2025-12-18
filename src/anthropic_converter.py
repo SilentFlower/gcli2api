@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
 from typing import Any, Dict, List, Optional, Union
 
 from log import log
@@ -246,6 +245,21 @@ def convert_messages_to_contents(messages: List[Dict[str, Any]]) -> List[Dict[st
             if _is_non_whitespace_text(raw_content):
                 parts = [{"text": str(raw_content)}]
         elif isinstance(raw_content, list):
+            # 下游在 thinking 启用时要求 assistant 的首块必须为 thinking/redacted_thinking。
+            # 如果客户端把 thinking 放在 tool_use 之后（或顺序不规范），这里做一次稳定重排：
+            # - 仅将“带 signature 的 thinking/redacted_thinking”提前到最前
+            # - 其它 block 相对顺序保持不变
+            if gemini_role == "model":
+                signed_thinking_blocks: List[Any] = []
+                remaining_blocks: List[Any] = []
+                for item in raw_content:
+                    if isinstance(item, dict) and item.get("type") in {"thinking", "redacted_thinking"}:
+                        if item.get("signature"):
+                            signed_thinking_blocks.append(item)
+                            continue
+                    remaining_blocks.append(item)
+                raw_content = signed_thinking_blocks + remaining_blocks
+
             for item in raw_content:
                 if not isinstance(item, dict):
                     if _is_non_whitespace_text(item):
@@ -381,20 +395,6 @@ def reorganize_tool_messages_with_options(
         for part in msg.get("parts", []) or []:
             flattened.append({"role": role, "parts": [part]})
 
-    def build_placeholder_thought_part() -> Dict[str, Any]:
-        """
-        为下游校验兜底生成最小 thought part。
-
-        说明：
-        - 下游可能要求 thinking block 必填 signature（否则会报 `thinking.signature: Field required`）
-        - 为降低“空字符串/空白字符串被当作无效内容”的风险，这里使用一个非空白占位字符作为 text
-        """
-        return {
-            "text": ".",
-            "thought": True,
-            "thoughtSignature": f"sig_{uuid.uuid4().hex}",
-        }
-
     new_contents: List[Dict[str, Any]] = []
     i = 0
     while i < len(flattened):
@@ -410,7 +410,7 @@ def reorganize_tool_messages_with_options(
             model_parts: List[Dict[str, Any]] = []
 
             # thinking 启用时，尽量把紧邻的 thought part 与 functionCall 合并，
-            # 否则在 functionCall 前补齐一个最小 thought part（避免下游 400）。
+            # 注意：signature 会被下游校验，服务端无法伪造有效 signature，因此这里只合并“客户端真实回放”的 thought。
             if thinking_enabled:
                 if (
                     new_contents
@@ -422,8 +422,6 @@ def reorganize_tool_messages_with_options(
                 ):
                     prev = new_contents.pop()
                     model_parts.append(prev["parts"][0])
-                else:
-                    model_parts.append(build_placeholder_thought_part())
 
             model_parts.append(part)
             new_contents.append({"role": "model", "parts": model_parts})
@@ -521,45 +519,73 @@ def build_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             thinking_config = get_thinking_config(thinking_value)
             include_thoughts = bool(thinking_config.get("includeThoughts", False))
 
+            def _content_has_signed_thinking_block(content: Any) -> bool:
+                if not isinstance(content, list):
+                    return False
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") in {"thinking", "redacted_thinking"} and item.get("signature"):
+                        return True
+                return False
+
+            last_assistant_msg: Optional[Dict[str, Any]] = None
+            last_assistant_content: Any = None
             last_assistant_first_block_type = None
+            last_assistant_first_block_has_signature = False
             for msg in reversed(payload.get("messages") or []):
                 if not isinstance(msg, dict):
                     continue
                 if msg.get("role") != "assistant":
                     continue
-                content = msg.get("content")
-                if not isinstance(content, list) or not content:
-                    continue
-                first_block = content[0]
-                if isinstance(first_block, dict):
-                    last_assistant_first_block_type = first_block.get("type")
-                else:
-                    last_assistant_first_block_type = None
+                last_assistant_msg = msg
+                last_assistant_content = msg.get("content")
+                if isinstance(last_assistant_content, list) and last_assistant_content:
+                    first_block = last_assistant_content[0]
+                    if isinstance(first_block, dict):
+                        last_assistant_first_block_type = first_block.get("type")
+                        if (
+                            last_assistant_first_block_type in {"thinking", "redacted_thinking"}
+                            and first_block.get("signature")
+                        ):
+                            last_assistant_first_block_has_signature = True
+                    else:
+                        last_assistant_first_block_type = None
                 break
 
-            if include_thoughts and last_assistant_first_block_type not in {
-                None,
-                "thinking",
-                "redacted_thinking",
-            }:
-                # 特殊兼容：若最后一条 assistant 以 tool_use 开头，项目会在 contents 侧做结构修补，
-                # 为其前置一个带 signature 的 thinking(thought) part，以满足下游校验。
-                # 因此这里不再跳过下发 thinkingConfig，避免把用户的 thinking 请求静默吞掉。
-                if last_assistant_first_block_type == "tool_use":
-                    if _anthropic_debug_enabled():
-                        log.info(
-                            "[ANTHROPIC][thinking] 检测到最后一条 assistant 以 tool_use 开头，"
-                            "将由服务端在下游 contents 前置 thinking(thought) block 以满足校验，"
-                            "因此继续下发 thinkingConfig"
-                        )
-                else:
-                    if _anthropic_debug_enabled():
-                        log.info(
-                            "[ANTHROPIC][thinking] 请求显式启用 thinking，但历史 messages 未回放 "
-                            "满足约束的 assistant thinking/redacted_thinking 起始块，已跳过下发 thinkingConfig（避免下游 400）"
-                        )
-                    return config
+            # 关键兼容点：本项目会丢弃“缺少 signature 的 thinking/redacted_thinking 回放块”，
+            # 以避免下游报 `thinking.signature: Field required` / `Invalid signature`。
+            # 因此当 includeThoughts=True 时，若最后一条 assistant 不满足“可用 signature 的 thinking 起始条件”，
+            # 必须自动降级为 includeThoughts=False，避免下游强校验触发 400。
+            if include_thoughts and last_assistant_msg is not None:
+                last_has_any_signed_thinking = _content_has_signed_thinking_block(last_assistant_content)
 
+                if last_assistant_first_block_type in {"thinking", "redacted_thinking"}:
+                    if not last_assistant_first_block_has_signature:
+                        if _anthropic_debug_enabled():
+                            log.info(
+                                "[ANTHROPIC][thinking] 最后一条 assistant 的首块为 thinking，但缺少 signature，"
+                                "将自动降级 includeThoughts=false 以适配下游校验"
+                            )
+                        thinking_config = {"includeThoughts": False}
+                        include_thoughts = False
+                else:
+                    # 非 thinking 起始：只有在 content 内确实存在带 signature 的 thinking block 时，
+                    # 才能依赖 `convert_messages_to_contents` 的稳定前置来满足约束；否则降级。
+                    if last_has_any_signed_thinking:
+                        if _anthropic_debug_enabled():
+                            log.info(
+                                "[ANTHROPIC][thinking] 最后一条 assistant 虽非 thinking 起始，但包含带 signature 的 thinking block，"
+                                "将由服务端稳定前置后继续下发 thinkingConfig"
+                            )
+                    else:
+                        if _anthropic_debug_enabled():
+                            log.info(
+                                "[ANTHROPIC][thinking] thinking 已请求启用，但最后一条 assistant 未包含可用 signature 的 thinking block，"
+                                "将自动降级 includeThoughts=false 以适配下游校验"
+                            )
+                        thinking_config = {"includeThoughts": False}
+                        include_thoughts = False
             max_tokens = payload.get("max_tokens")
             if include_thoughts and isinstance(max_tokens, int):
                 budget = thinking_config.get("thinkingBudget")
