@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from typing import Any, Dict, List, Optional, Union
 
 from log import log
@@ -348,6 +349,23 @@ def reorganize_tool_messages(contents: List[Dict[str, Any]]) -> List[Dict[str, A
 
     注意：如果客户端根本没有提供 tool_result，本函数无法凭空补齐，只能尽力重排。
     """
+
+    return reorganize_tool_messages_with_options(contents)
+
+
+def reorganize_tool_messages_with_options(
+    contents: List[Dict[str, Any]],
+    *,
+    thinking_enabled: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    `reorganize_tool_messages` 的可选增强版：在保证 tool_use/tool_result 相邻的同时，
+    在 thinking 启用且 assistant 以 tool_use 开头时，为下游补齐最小 thinking 起始块以通过校验。
+
+    背景：部分下游在 thinking 启用时要求“最后一条 assistant message 必须以 thinking/redacted_thinking 开头，
+    并且位于最后一组 tool_use/tool_result 之前”。在本项目的“平铺 parts → 单 part 消息”实现下，
+    tool_use 容易被拆成独立的 model 消息，从而变成“首块为 tool_use”，触发 400。
+    """
     tool_results: Dict[str, Dict[str, Any]] = {}
 
     for msg in contents:
@@ -363,6 +381,20 @@ def reorganize_tool_messages(contents: List[Dict[str, Any]]) -> List[Dict[str, A
         for part in msg.get("parts", []) or []:
             flattened.append({"role": role, "parts": [part]})
 
+    def build_placeholder_thought_part() -> Dict[str, Any]:
+        """
+        为下游校验兜底生成最小 thought part。
+
+        说明：
+        - 下游可能要求 thinking block 必填 signature（否则会报 `thinking.signature: Field required`）
+        - 为降低“空字符串/空白字符串被当作无效内容”的风险，这里使用一个非空白占位字符作为 text
+        """
+        return {
+            "text": ".",
+            "thought": True,
+            "thoughtSignature": f"sig_{uuid.uuid4().hex}",
+        }
+
     new_contents: List[Dict[str, Any]] = []
     i = 0
     while i < len(flattened):
@@ -375,7 +407,26 @@ def reorganize_tool_messages(contents: List[Dict[str, Any]]) -> List[Dict[str, A
 
         if isinstance(part, dict) and "functionCall" in part:
             tool_id = (part.get("functionCall") or {}).get("id")
-            new_contents.append({"role": "model", "parts": [part]})
+            model_parts: List[Dict[str, Any]] = []
+
+            # thinking 启用时，尽量把紧邻的 thought part 与 functionCall 合并，
+            # 否则在 functionCall 前补齐一个最小 thought part（避免下游 400）。
+            if thinking_enabled:
+                if (
+                    new_contents
+                    and new_contents[-1].get("role") == "model"
+                    and isinstance(new_contents[-1].get("parts"), list)
+                    and len(new_contents[-1]["parts"]) == 1
+                    and isinstance(new_contents[-1]["parts"][0], dict)
+                    and new_contents[-1]["parts"][0].get("thought") is True
+                ):
+                    prev = new_contents.pop()
+                    model_parts.append(prev["parts"][0])
+                else:
+                    model_parts.append(build_placeholder_thought_part())
+
+            model_parts.append(part)
+            new_contents.append({"role": "model", "parts": model_parts})
 
             if tool_id is not None and str(tool_id) in tool_results:
                 new_contents.append({"role": "user", "parts": [tool_results[str(tool_id)]]})
@@ -491,12 +542,23 @@ def build_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "thinking",
                 "redacted_thinking",
             }:
-                if _anthropic_debug_enabled():
-                    log.info(
-                        "[ANTHROPIC][thinking] 请求显式启用 thinking，但历史 messages 未回放 "
-                        "满足约束的 assistant thinking/redacted_thinking 起始块，已跳过下发 thinkingConfig（避免下游 400）"
-                    )
-                return config
+                # 特殊兼容：若最后一条 assistant 以 tool_use 开头，项目会在 contents 侧做结构修补，
+                # 为其前置一个带 signature 的 thinking(thought) part，以满足下游校验。
+                # 因此这里不再跳过下发 thinkingConfig，避免把用户的 thinking 请求静默吞掉。
+                if last_assistant_first_block_type == "tool_use":
+                    if _anthropic_debug_enabled():
+                        log.info(
+                            "[ANTHROPIC][thinking] 检测到最后一条 assistant 以 tool_use 开头，"
+                            "将由服务端在下游 contents 前置 thinking(thought) block 以满足校验，"
+                            "因此继续下发 thinkingConfig"
+                        )
+                else:
+                    if _anthropic_debug_enabled():
+                        log.info(
+                            "[ANTHROPIC][thinking] 请求显式启用 thinking，但历史 messages 未回放 "
+                            "满足约束的 assistant thinking/redacted_thinking 起始块，已跳过下发 thinkingConfig（避免下游 400）"
+                        )
+                    return config
 
             max_tokens = payload.get("max_tokens")
             if include_thoughts and isinstance(max_tokens, int):
@@ -550,7 +612,19 @@ def convert_anthropic_request_to_antigravity_components(payload: Dict[str, Any])
         messages = []
 
     contents = convert_messages_to_contents(messages)
-    contents = reorganize_tool_messages(contents)
+
+    # thinking 启用判断（按你的选择：仅依据客户端请求语义，不根据模型名推断）：
+    # - 当请求显式传入 thinking 且 includeThoughts=True 时视为启用
+    thinking_enabled = False
+    if "thinking" in payload:
+        thinking_value = payload.get("thinking")
+        if thinking_value is not None:
+            try:
+                thinking_enabled = bool(get_thinking_config(thinking_value).get("includeThoughts") is True)
+            except Exception:
+                thinking_enabled = False
+
+    contents = reorganize_tool_messages_with_options(contents, thinking_enabled=thinking_enabled)
     system_instruction = build_system_instruction(payload.get("system"))
     tools = convert_tools(payload.get("tools"))
     generation_config = build_generation_config(payload)

@@ -333,6 +333,98 @@ def test_thinking_enabled_但最后一条_assistant_不以_thinking_开头_会�
     assert "thinkingConfig" not in components["generation_config"]
 
 
+def test_thinking_enabled_最后一条assistant以tool_use开头_会前置thinking块并仍下发thinkingConfig():
+    payload = {
+        "model": "claude-opus-4-5-20251101",
+        "max_tokens": 128,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "a"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "name": "search", "content": "ok"}
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "name": "search",
+                "description": "test",
+                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }
+        ],
+    }
+
+    components = convert_anthropic_request_to_antigravity_components(payload)
+    assert "thinkingConfig" in components["generation_config"]
+
+    # 断言：下游 model 消息（functionCall）会以 thought 起始，避免下游“thinking enabled 时首块为 tool_use”的 400
+    tool_call_msg = None
+    for msg in components["contents"]:
+        if msg.get("role") != "model":
+            continue
+        parts = msg.get("parts") or []
+        if any(isinstance(p, dict) and "functionCall" in p for p in parts):
+            tool_call_msg = msg
+            break
+
+    assert tool_call_msg is not None
+    assert tool_call_msg["parts"][0].get("thought") is True
+    assert tool_call_msg["parts"][0].get("thoughtSignature")
+    assert tool_call_msg["parts"][1].get("functionCall", {}).get("id") == "t1"
+
+
+def test_未显式启用thinking_即使模型映射为_thinking_也不前置占位thinking块():
+    payload = {
+        "model": "claude-opus-4-5-20251101",  # 会映射为 claude-opus-4-5-thinking
+        "max_tokens": 128,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "a"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "name": "search", "content": "ok"}
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "name": "search",
+                "description": "test",
+                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }
+        ],
+    }
+
+    components = convert_anthropic_request_to_antigravity_components(payload)
+    assert "thinkingConfig" not in components["generation_config"]
+
+    tool_call_msg = None
+    for msg in components["contents"]:
+        if msg.get("role") != "model":
+            continue
+        parts = msg.get("parts") or []
+        if any(isinstance(p, dict) and "functionCall" in p for p in parts):
+            tool_call_msg = msg
+            break
+
+    assert tool_call_msg is not None
+    assert tool_call_msg["parts"][0].get("functionCall", {}).get("id") == "t1"
+
+
 def test_antigravity_response_to_anthropic_message_映射_stop_reason_usage():
     response_data = {
         "response": {
