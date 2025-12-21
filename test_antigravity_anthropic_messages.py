@@ -299,6 +299,28 @@ def test_convert_request_components_tools_schema_不会包含type数组_避免�
     assert params["properties"]["follow_up"]["items"]["properties"]["mode"]["nullable"] is True
 
 
+def test_convert_request_components_tools_缺失input_schema_会补齐type_object_避免下游400():
+    payload = {
+        "model": "claude-opus-4-5-20251101",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+        # claude-cli / Claude Code 的内置工具声明可能没有 input_schema
+        "tools": [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 8,
+            }
+        ],
+    }
+
+    components = convert_anthropic_request_to_antigravity_components(payload)
+    assert components["tools"]
+    params = components["tools"][0]["functionDeclarations"][0]["parameters"]
+    assert params["type"] == "object"
+    assert isinstance(params.get("properties"), dict)
+
+
 def test_reorganize_tool_messages_会把_tool_result_移动到_tool_use_之后():
     contents = [
         {"role": "user", "parts": [{"text": "hi"}]},

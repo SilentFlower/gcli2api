@@ -236,7 +236,16 @@ def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[L
             continue
         description = tool.get("description", "")
         input_schema = tool.get("input_schema", {}) or {}
+        # 兼容 claude-cli / Claude Code 的内置工具声明：
+        # 可能只给出 name/type/max_uses 而缺少 input_schema。
+        # 下游（Antigravity/Vertex）工具 schema 校验要求 input_schema.type 必填，
+        # 这里补齐最小可用 schema，避免 400。
+        if not isinstance(input_schema, dict) or not input_schema:
+            input_schema = {"type": "object", "properties": {}}
         parameters = clean_json_schema(input_schema)
+        if isinstance(parameters, dict) and "type" not in parameters:
+            parameters["type"] = "object"
+            parameters.setdefault("properties", {})
 
         gemini_tools.append(
             {
